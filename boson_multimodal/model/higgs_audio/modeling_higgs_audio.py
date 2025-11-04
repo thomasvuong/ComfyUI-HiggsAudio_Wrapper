@@ -15,17 +15,41 @@ from typing import Optional, Tuple, Union, List, Dict, Any
 from transformers import AutoTokenizer
 from transformers.modeling_outputs import BaseModelOutput
 from transformers.models.whisper.modeling_whisper import WhisperEncoderLayer
-from transformers.models.llama.modeling_llama import (
-    LlamaDecoderLayer,
-    LlamaRMSNorm,
-    LlamaRotaryEmbedding,
-    LLAMA_ATTENTION_CLASSES,
-    LlamaMLP,
-    LlamaRMSNorm,
-)
+
+# Compatibility patch for transformers >=4.51.3 where LLAMA_ATTENTION_CLASSES was removed
+try:
+    from transformers.models.llama.modeling_llama import (
+        LlamaDecoderLayer,
+        LlamaRMSNorm,
+        LlamaRotaryEmbedding,
+        LLAMA_ATTENTION_CLASSES,
+        LlamaMLP,
+    )
+except ImportError:
+    # LLAMA_ATTENTION_CLASSES was removed in newer transformers versions
+    # In newer transformers, only LlamaAttention exists and handles all attention types
+    from transformers.models.llama.modeling_llama import (
+        LlamaDecoderLayer,
+        LlamaRMSNorm,
+        LlamaRotaryEmbedding,
+        LlamaMLP,
+        LlamaAttention,
+    )
+
+    # Recreate LLAMA_ATTENTION_CLASSES mapping - all point to the unified LlamaAttention
+    LLAMA_ATTENTION_CLASSES = {
+        "eager": LlamaAttention,
+        "flash_attention_2": LlamaAttention,
+        "sdpa": LlamaAttention,
+    }
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
-from transformers.generation import GenerationMixin, GenerationConfig, LogitsProcessorList, StoppingCriteriaList
+from transformers.generation import (
+    GenerationMixin,
+    GenerationConfig,
+    LogitsProcessorList,
+    StoppingCriteriaList,
+)
 from transformers.generation.utils import GenerateNonBeamOutput
 from transformers.utils import logging, ModelOutput
 
@@ -40,6 +64,42 @@ from .cuda_graph_runner import CUDAGraphRunner
 from .audio_head import HiggsAudioDecoderProjector
 
 logger = logging.get_logger(__name__)
+
+
+# Compatibility helper for transformers Cache API changes
+def _get_cache_max_length(cache, layer_idx=0):
+    """
+    Get maximum cache length - compatible with both old and new transformers versions.
+
+    Old API: cache.get_max_length()
+    New API: cache.get_max_cache_shape(layer_idx)
+    """
+    if hasattr(cache, "get_max_length"):
+        # Old API (transformers < 4.46)
+        return cache.get_max_length()
+    elif hasattr(cache, "get_max_cache_shape"):
+        # New API (transformers >= 4.46)
+        return cache.get_max_cache_shape(layer_idx)
+    else:
+        # Fallback - shouldn't happen but handle gracefully
+        raise AttributeError(
+            f"Cache object {type(cache)} has neither get_max_length nor get_max_cache_shape"
+        )
+
+
+def _get_pad_token_tensor(generation_config):
+    """
+    Get pad token as tensor - compatible with both old and new transformers versions.
+
+    Old API: generation_config._pad_token_tensor
+    New API: generation_config.pad_token_id (convert to tensor if needed)
+    """
+    if hasattr(generation_config, "_pad_token_tensor"):
+        # Old API (transformers < 4.46)
+        return generation_config._pad_token_tensor
+    else:
+        # New API (transformers >= 4.46) - return the scalar, conversion happens elsewhere if needed
+        return generation_config.pad_token_id
 
 
 class GenerationMode(Enum):
@@ -67,14 +127,31 @@ def _whisper_encoder_zero_shape_forward(whisper_encoder, *args, **kwargs):
 
     global _higgs_flash_attention_forward
 
-    def _patched_shape(tensor: torch.Tensor, seq_len: int, bsz: int, num_heads: int, head_dim: int):
+    def _patched_shape(
+        tensor: torch.Tensor, seq_len: int, bsz: int, num_heads: int, head_dim: int
+    ):
         if seq_len == -1:
-            return tensor.view(bsz, tensor.shape[1], num_heads, head_dim).transpose(1, 2).contiguous()
+            return (
+                tensor.view(bsz, tensor.shape[1], num_heads, head_dim)
+                .transpose(1, 2)
+                .contiguous()
+            )
         else:
-            return tensor.view(bsz, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
+            return (
+                tensor.view(bsz, seq_len, num_heads, head_dim)
+                .transpose(1, 2)
+                .contiguous()
+            )
 
     def _patched_scaled_dot_product_attention(
-        query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False
+        query,
+        key,
+        value,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=None,
+        enable_gqa=False,
     ) -> torch.Tensor:
         # IMPORTANT! Implementation here is wrong and is only for the purpose of obtaining the correct attn_weight shape
         if enable_gqa:
@@ -90,18 +167,28 @@ def _whisper_encoder_zero_shape_forward(whisper_encoder, *args, **kwargs):
         for layer in whisper_encoder.layers:
             old_shape_functions.append(getattr(layer.self_attn, "_shape"))
             layer.self_attn._shape = functools.partial(
-                _patched_shape, num_heads=layer.self_attn.num_heads, head_dim=layer.self_attn.head_dim
+                _patched_shape,
+                num_heads=layer.self_attn.num_heads,
+                head_dim=layer.self_attn.head_dim,
             )
 
-    original_scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
-    torch.nn.functional.scaled_dot_product_attention = _patched_scaled_dot_product_attention
+    original_scaled_dot_product_attention = (
+        torch.nn.functional.scaled_dot_product_attention
+    )
+    torch.nn.functional.scaled_dot_product_attention = (
+        _patched_scaled_dot_product_attention
+    )
 
     out = whisper_encoder(*args, **kwargs)
-    torch.nn.functional.scaled_dot_product_attention = original_scaled_dot_product_attention
+    torch.nn.functional.scaled_dot_product_attention = (
+        original_scaled_dot_product_attention
+    )
 
     # Restore the original shape functions
     if whisper_encoder.config._attn_implementation != "flash_attention_2":
-        for layer, old_shape_function in zip(whisper_encoder.layers, old_shape_functions):
+        for layer, old_shape_function in zip(
+            whisper_encoder.layers, old_shape_functions
+        ):
             layer.self_attn._shape = old_shape_function
 
     return out
@@ -143,19 +230,30 @@ def _prepare_4d_causal_attention_mask_with_cache_position(
         # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
         causal_mask = attention_mask
     else:
-        causal_mask = torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device)
+        causal_mask = torch.full(
+            (sequence_length, target_length),
+            fill_value=min_dtype,
+            dtype=dtype,
+            device=device,
+        )
         if sequence_length != 1:
             causal_mask = torch.triu(causal_mask, diagonal=1)
-        causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
+        causal_mask *= torch.arange(
+            target_length, device=device
+        ) > cache_position.reshape(-1, 1)
         causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
         if attention_mask is not None:
-            causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
+            causal_mask = (
+                causal_mask.clone()
+            )  # copy to contiguous memory for in-place edit
             mask_length = attention_mask.shape[-1]
-            padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
-            padding_mask = padding_mask == 0
-            causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
-                padding_mask, min_dtype
+            padding_mask = (
+                causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
             )
+            padding_mask = padding_mask == 0
+            causal_mask[:, :, :, :mask_length] = causal_mask[
+                :, :, :, :mask_length
+            ].masked_fill(padding_mask, min_dtype)
 
     return causal_mask
 
@@ -165,7 +263,11 @@ class HiggsAudioFeatureProjector(nn.Module):
 
     def __init__(self, config: HiggsAudioConfig):
         super().__init__()
-        self.linear = nn.Linear(config.audio_encoder_config.d_model, config.text_config.hidden_size, bias=True)
+        self.linear = nn.Linear(
+            config.audio_encoder_config.d_model,
+            config.text_config.hidden_size,
+            bias=True,
+        )
 
     def forward(self, audio_features):
         hidden_states = self.linear(audio_features)
@@ -206,7 +308,9 @@ class HiggsAudioEncoder(HiggsAudioPreTrainedModel):
         self.embed_positions.requires_grad_(False)
 
         # Flash Attention 2 does not support zero shape tensor, so we have to use sdpa implementation for the Whisper component.
-        self.layers = nn.ModuleList([WhisperEncoderLayer(config) for _ in range(config.encoder_layers)])
+        self.layers = nn.ModuleList(
+            [WhisperEncoderLayer(config) for _ in range(config.encoder_layers)]
+        )
         self.layer_norm = nn.LayerNorm(config.d_model)
         # Ignore copy
         self.avg_pooler = nn.AvgPool1d(2, stride=2)
@@ -262,20 +366,34 @@ class HiggsAudioEncoder(HiggsAudioPreTrainedModel):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
 
-        expected_seq_length = self.config.max_source_positions * self.conv1.stride[0] * self.conv2.stride[0]
+        expected_seq_length = (
+            self.config.max_source_positions
+            * self.conv1.stride[0]
+            * self.conv2.stride[0]
+        )
         if check_seq_length and (input_features.shape[-1] != expected_seq_length):
             raise ValueError(
                 f"HiggsAudio expects the mel input features to be of length {expected_seq_length}, but found {input_features.shape[-1]}. Make sure to pad the input mel features to {expected_seq_length}."
             )
 
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         # Ignore copy
-        input_features = input_features.to(dtype=self.conv1.weight.dtype, device=self.conv1.weight.device)
+        input_features = input_features.to(
+            dtype=self.conv1.weight.dtype, device=self.conv1.weight.device
+        )
 
         inputs_embeds = nn.functional.gelu(self.conv1(input_features))
         inputs_embeds = nn.functional.gelu(self.conv2(inputs_embeds))
@@ -284,7 +402,9 @@ class HiggsAudioEncoder(HiggsAudioPreTrainedModel):
         embed_pos = self.embed_positions.weight
 
         hidden_states = inputs_embeds + embed_pos
-        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+        hidden_states = nn.functional.dropout(
+            hidden_states, p=self.dropout, training=self.training
+        )
 
         encoder_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
@@ -321,7 +441,9 @@ class HiggsAudioEncoder(HiggsAudioPreTrainedModel):
                     layer_outputs = encoder_layer(
                         hidden_states,
                         attention_mask,
-                        layer_head_mask=(head_mask[idx] if head_mask is not None else None),
+                        layer_head_mask=(
+                            head_mask[idx] if head_mask is not None else None
+                        ),
                         output_attentions=output_attentions,
                     )
 
@@ -344,9 +466,15 @@ class HiggsAudioEncoder(HiggsAudioPreTrainedModel):
             encoder_states = encoder_states + (hidden_states,)
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None)
+            return tuple(
+                v
+                for v in [hidden_states, encoder_states, all_attentions]
+                if v is not None
+            )
         return BaseModelOutput(
-            last_hidden_state=hidden_states, hidden_states=encoder_states, attentions=all_attentions
+            last_hidden_state=hidden_states,
+            hidden_states=encoder_states,
+            attentions=all_attentions,
         )
 
     # Ignore copy
@@ -395,13 +523,19 @@ class HiggsAudioDualFFNDecoderLayer(nn.Module):
     """
 
     def __init__(
-        self, config: HiggsAudioConfig, layer_idx: int, fast_forward: bool = False, use_audio_attention: bool = False
+        self,
+        config: HiggsAudioConfig,
+        layer_idx: int,
+        fast_forward: bool = False,
+        use_audio_attention: bool = False,
     ):
         super().__init__()
         text_config = config.text_config
         self.hidden_size = text_config.hidden_size
         self.layer_idx = layer_idx
-        self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=text_config, layer_idx=layer_idx)
+        self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](
+            config=text_config, layer_idx=layer_idx
+        )
 
         self.mlp = LlamaMLP(text_config)
 
@@ -415,8 +549,12 @@ class HiggsAudioDualFFNDecoderLayer(nn.Module):
                 )
 
             self.audio_mlp = LlamaMLP(text_config)
-            self.audio_input_layernorm = LlamaRMSNorm(text_config.hidden_size, eps=text_config.rms_norm_eps)
-            self.audio_post_attention_layernorm = LlamaRMSNorm(text_config.hidden_size, eps=text_config.rms_norm_eps)
+            self.audio_input_layernorm = LlamaRMSNorm(
+                text_config.hidden_size, eps=text_config.rms_norm_eps
+            )
+            self.audio_post_attention_layernorm = LlamaRMSNorm(
+                text_config.hidden_size, eps=text_config.rms_norm_eps
+            )
 
         self.use_audio_attention = use_audio_attention
         self.fast_forward = fast_forward
@@ -424,8 +562,12 @@ class HiggsAudioDualFFNDecoderLayer(nn.Module):
             assert not self.use_audio_attention, (
                 "We cannot use audio_attention if the layer is marked as fast-forward."
             )
-        self.input_layernorm = LlamaRMSNorm(text_config.hidden_size, eps=text_config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(text_config.hidden_size, eps=text_config.rms_norm_eps)
+        self.input_layernorm = LlamaRMSNorm(
+            text_config.hidden_size, eps=text_config.rms_norm_eps
+        )
+        self.post_attention_layernorm = LlamaRMSNorm(
+            text_config.hidden_size, eps=text_config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -440,7 +582,9 @@ class HiggsAudioDualFFNDecoderLayer(nn.Module):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+        position_embeddings: Optional[
+            Tuple[torch.Tensor, torch.Tensor]
+        ] = None,  # will become mandatory in v4.46
         is_using_cuda_graph: Optional[bool] = False,
         **kwargs,
     ):
@@ -507,15 +651,17 @@ class HiggsAudioDualFFNDecoderLayer(nn.Module):
 
                 if self.self_attn.config._attn_implementation != "flash_attention_2":
                     sequence_length = audio_out_mask.shape[1]
-                    attention_mask = _prepare_4d_causal_attention_mask_with_cache_position(
-                        attention_mask=attention_mask,
-                        sequence_length=sequence_length,
-                        target_length=sequence_length,
-                        dtype=hidden_states.dtype,
-                        min_dtype=min_dtype,
-                        device=hidden_states.device,
-                        cache_position=cache_position,
-                        batch_size=hidden_states.shape[0],
+                    attention_mask = (
+                        _prepare_4d_causal_attention_mask_with_cache_position(
+                            attention_mask=attention_mask,
+                            sequence_length=sequence_length,
+                            target_length=sequence_length,
+                            dtype=hidden_states.dtype,
+                            min_dtype=min_dtype,
+                            device=hidden_states.device,
+                            cache_position=cache_position,
+                            batch_size=hidden_states.shape[0],
+                        )
                     )
                     if use_cache:
                         attention_mask = attention_mask[:, :, -target_length:, :]
@@ -532,18 +678,28 @@ class HiggsAudioDualFFNDecoderLayer(nn.Module):
                         # Attention mask has shape (batch_size, 1, query_length, key_length)
                         # In addition, the attention mask should be inverted, that means "1" (attend_to) --> "0", and "0" --> minimal dtype value.
                         attention_mask = attention_mask.masked_fill(
-                            audio_out_mask[:, -target_length:].reshape(audio_out_mask.shape[0], 1, target_length, 1)
-                            | audio_out_mask.reshape(audio_out_mask.shape[0], 1, 1, audio_out_mask.shape[1]),
+                            audio_out_mask[:, -target_length:].reshape(
+                                audio_out_mask.shape[0], 1, target_length, 1
+                            )
+                            | audio_out_mask.reshape(
+                                audio_out_mask.shape[0], 1, 1, audio_out_mask.shape[1]
+                            ),
                             min_dtype,
                         )
                     else:
                         attention_mask = attention_mask.masked_fill(
-                            audio_out_mask.reshape(audio_out_mask.shape[0], 1, audio_out_mask.shape[1], 1)
-                            | audio_out_mask.reshape(audio_out_mask.shape[0], 1, 1, audio_out_mask.shape[1]),
+                            audio_out_mask.reshape(
+                                audio_out_mask.shape[0], 1, audio_out_mask.shape[1], 1
+                            )
+                            | audio_out_mask.reshape(
+                                audio_out_mask.shape[0], 1, 1, audio_out_mask.shape[1]
+                            ),
                             min_dtype,
                         )
             else:
-                raise NotImplementedError(f"Unsupported attention_mask format, attention_mask={attention_mask}")
+                raise NotImplementedError(
+                    f"Unsupported attention_mask format, attention_mask={attention_mask}"
+                )
 
             if (
                 self.self_attn.config._attn_implementation == "sdpa"
@@ -554,7 +710,9 @@ class HiggsAudioDualFFNDecoderLayer(nn.Module):
                 # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
                 # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
                 # Details: https://github.com/pytorch/pytorch/issues/110213
-                attention_mask = AttentionMaskConverter._unmask_unattended(attention_mask, min_dtype)
+                attention_mask = AttentionMaskConverter._unmask_unattended(
+                    attention_mask, min_dtype
+                )
 
         if has_audio_out and not self.fast_forward:
             # Apply separate layernorm layers for audio tokens and text tokens
@@ -583,36 +741,51 @@ class HiggsAudioDualFFNDecoderLayer(nn.Module):
             if audio_attention_mask is None:
                 no_audio_out_mask = (~audio_out_mask)[:, -target_length:].reshape(
                     audio_out_mask.shape[0], 1, target_length, 1
-                ) | (~audio_out_mask).reshape(audio_out_mask.shape[0], 1, 1, audio_out_mask.shape[1])
+                ) | (~audio_out_mask).reshape(
+                    audio_out_mask.shape[0], 1, 1, audio_out_mask.shape[1]
+                )
                 min_dtype = torch.finfo(hidden_states.dtype).min
 
                 if attention_mask is None:
                     audio_attention_mask = audio_out_mask
 
-                    if self.audio_attn.config._attn_implementation != "flash_attention_2":
+                    if (
+                        self.audio_attn.config._attn_implementation
+                        != "flash_attention_2"
+                    ):
                         sequence_length = audio_out_mask.shape[1]
-                        audio_attention_mask = _prepare_4d_causal_attention_mask_with_cache_position(
-                            attention_mask=audio_attention_mask,
-                            sequence_length=sequence_length,
-                            target_length=sequence_length,
-                            dtype=hidden_states.dtype,
-                            min_dtype=min_dtype,
-                            device=hidden_states.device,
-                            cache_position=cache_position,
-                            batch_size=hidden_states.shape[0],
+                        audio_attention_mask = (
+                            _prepare_4d_causal_attention_mask_with_cache_position(
+                                attention_mask=audio_attention_mask,
+                                sequence_length=sequence_length,
+                                target_length=sequence_length,
+                                dtype=hidden_states.dtype,
+                                min_dtype=min_dtype,
+                                device=hidden_states.device,
+                                cache_position=cache_position,
+                                batch_size=hidden_states.shape[0],
+                            )
                         )
                         if use_cache:
-                            audio_attention_mask = audio_attention_mask[:, :, -target_length:, :]
-                        audio_attention_mask = audio_attention_mask.masked_fill(no_audio_out_mask, min_dtype)
+                            audio_attention_mask = audio_attention_mask[
+                                :, :, -target_length:, :
+                            ]
+                        audio_attention_mask = audio_attention_mask.masked_fill(
+                            no_audio_out_mask, min_dtype
+                        )
                 elif len(attention_mask.shape) == 2:
                     # Attention mask has shape (batch_size, sequence_length)
                     audio_attention_mask = attention_mask * audio_out_mask
                 elif len(attention_mask.shape) == 4:
                     # Attention mask has shape (batch_size, 1, query_length, key_length)
                     # In addition, the attention mask should be inverted. This means "1" (attend_to) --> "0", and "0" --> minimal dtype value.
-                    audio_attention_mask = attention_mask.masked_fill(no_audio_out_mask, min_dtype)
+                    audio_attention_mask = attention_mask.masked_fill(
+                        no_audio_out_mask, min_dtype
+                    )
                 else:
-                    raise NotImplementedError(f"Unsupported attention_mask format, attention_mask={attention_mask}")
+                    raise NotImplementedError(
+                        f"Unsupported attention_mask format, attention_mask={attention_mask}"
+                    )
 
                 if (
                     self.audio_attn.config._attn_implementation == "sdpa"
@@ -623,38 +796,55 @@ class HiggsAudioDualFFNDecoderLayer(nn.Module):
                     # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
                     # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
                     # Details: https://github.com/pytorch/pytorch/issues/110213
-                    audio_attention_mask = AttentionMaskConverter._unmask_unattended(audio_attention_mask, min_dtype)
+                    audio_attention_mask = AttentionMaskConverter._unmask_unattended(
+                        audio_attention_mask, min_dtype
+                    )
 
             audio_attention_mask = audio_attention_mask.contiguous()
 
-            audio_hidden_states, audio_self_attn_weights, audio_present_key_value = self.audio_attn(
-                hidden_states=hidden_states,
-                attention_mask=audio_attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-                **kwargs,
+            audio_hidden_states, audio_self_attn_weights, audio_present_key_value = (
+                self.audio_attn(
+                    hidden_states=hidden_states,
+                    attention_mask=audio_attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
             )
             audio_hidden_states = residual + audio_hidden_states
             if use_cache:
                 residual = torch.where(
-                    audio_out_mask_sq[:, -target_length:].unsqueeze(-1), audio_hidden_states, residual
+                    audio_out_mask_sq[:, -target_length:].unsqueeze(-1),
+                    audio_hidden_states,
+                    residual,
                 )
             else:
-                residual = torch.where(audio_out_mask_sq.unsqueeze(-1), audio_hidden_states, residual)
-            audio_hidden_states = self.audio_post_audio_attn_layer_norm(audio_hidden_states)
+                residual = torch.where(
+                    audio_out_mask_sq.unsqueeze(-1), audio_hidden_states, residual
+                )
+            audio_hidden_states = self.audio_post_audio_attn_layer_norm(
+                audio_hidden_states
+            )
             if use_cache:
                 hidden_states = torch.where(
-                    audio_out_mask_sq[:, -target_length:].unsqueeze(-1), audio_hidden_states, hidden_states
+                    audio_out_mask_sq[:, -target_length:].unsqueeze(-1),
+                    audio_hidden_states,
+                    hidden_states,
                 )
             else:
-                hidden_states = torch.where(audio_out_mask_sq.unsqueeze(-1), audio_hidden_states, hidden_states)
+                hidden_states = torch.where(
+                    audio_out_mask_sq.unsqueeze(-1), audio_hidden_states, hidden_states
+                )
 
         # Text Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        # Different attention implementations may return either 3 values
+        # (hidden_states, attn_weights, present_key_value) or 2 values
+        # (hidden_states, present_key_value). Handle both variants.
+        _attn_out = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -665,6 +855,25 @@ class HiggsAudioDualFFNDecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             **kwargs,
         )
+
+        # Unpack flexibly
+        if isinstance(_attn_out, (tuple, list)):
+            if len(_attn_out) == 3:
+                hidden_states, self_attn_weights, present_key_value = _attn_out
+            elif len(_attn_out) == 2:
+                hidden_states, present_key_value = _attn_out
+                self_attn_weights = None
+            else:
+                # Unexpected shape: fall back to first/last
+                hidden_states = _attn_out[0]
+                present_key_value = _attn_out[-1] if len(_attn_out) > 1 else None
+                self_attn_weights = None
+        else:
+            # Single return (very unlikely) — treat as hidden_states only
+            hidden_states = _attn_out
+            self_attn_weights = None
+            present_key_value = None
+
         hidden_states = residual + hidden_states
 
         # Apply Dual-path FFN
@@ -689,8 +898,12 @@ class HiggsAudioDualFFNDecoderLayer(nn.Module):
                     hidden_states = self.mlp(hidden_states)
                 residual = residual + hidden_states
             else:
-                text_hidden_states = self.post_attention_layernorm(hidden_states[~real_audio_out_mask])
-                audio_hidden_states = self.audio_post_attention_layernorm(hidden_states[real_audio_out_mask])
+                text_hidden_states = self.post_attention_layernorm(
+                    hidden_states[~real_audio_out_mask]
+                )
+                audio_hidden_states = self.audio_post_attention_layernorm(
+                    hidden_states[real_audio_out_mask]
+                )
 
                 text_hidden_states = self.mlp(text_hidden_states)
                 residual[~real_audio_out_mask] += text_hidden_states
@@ -707,17 +920,27 @@ class HiggsAudioDualFFNDecoderLayer(nn.Module):
         if self.fast_forward and has_audio_out:
             if use_cache:
                 hidden_states = torch.where(
-                    audio_out_mask_sq[:, -target_length:].unsqueeze(-1), original_hidden_states, hidden_states
+                    audio_out_mask_sq[:, -target_length:].unsqueeze(-1),
+                    original_hidden_states,
+                    hidden_states,
                 )
             else:
-                hidden_states = torch.where(audio_out_mask_sq.unsqueeze(-1), original_hidden_states, hidden_states)
+                hidden_states = torch.where(
+                    audio_out_mask_sq.unsqueeze(-1),
+                    original_hidden_states,
+                    hidden_states,
+                )
 
         outputs = (hidden_states,)
 
         if output_attentions:
             if self.use_audio_attention:
                 # The returned attn weights have shape (batch_size, num_heads + num_audio_attn_heads, seq_length, seq_length)
-                outputs += (torch.concat([self_attn_weights, audio_self_attn_weights], dim=1),)
+                if self_attn_weights is None:
+                    # Some attention implementations don't return attentions; include only audio attentions
+                    outputs += (audio_self_attn_weights,)
+                else:
+                    outputs += (torch.concat([self_attn_weights, audio_self_attn_weights], dim=1),)
             else:
                 # The returned attn weights have shape (batch_size, num_heads, seq_length, seq_length)
                 outputs += (self_attn_weights,)
@@ -825,7 +1048,9 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
         self.use_audio_out_embed_projector = config.use_audio_out_embed_projector
         self.use_audio_out_self_attention = config.use_audio_out_self_attention
 
-        self.embed_tokens = nn.Embedding(self.vocab_size, config.text_config.hidden_size, self.padding_idx)
+        self.embed_tokens = nn.Embedding(
+            self.vocab_size, config.text_config.hidden_size, self.padding_idx
+        )
 
         if config.audio_adapter_type == "dual_ffn":
             layer_idx = 0
@@ -834,7 +1059,9 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
                 if j in config.audio_dual_ffn_layers:
                     layers.append(
                         HiggsAudioDualFFNDecoderLayer(
-                            config, layer_idx, use_audio_attention=self.use_audio_out_self_attention
+                            config,
+                            layer_idx,
+                            use_audio_attention=self.use_audio_out_self_attention,
                         )
                     )
                     layer_idx += 2 if self.use_audio_out_self_attention else 1
@@ -858,7 +1085,12 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
                     layer_idx += 2 if self.use_audio_out_self_attention else 1
                 else:
                     layers.append(
-                        HiggsAudioDualFFNDecoderLayer(config, layer_idx, fast_forward=True, use_audio_attention=False)
+                        HiggsAudioDualFFNDecoderLayer(
+                            config,
+                            layer_idx,
+                            fast_forward=True,
+                            use_audio_attention=False,
+                        )
                     )
                     layer_idx += 1
             self.layers = nn.ModuleList(layers)
@@ -871,12 +1103,16 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
             )
             layer_idx = config.text_config.num_hidden_layers
         else:
-            raise NotImplementedError(f"Audio adapter type {config.audio_adapter_type} not implemented.")
+            raise NotImplementedError(
+                f"Audio adapter type {config.audio_adapter_type} not implemented."
+            )
 
         self.num_activation_checkpointing_layers = len(self.layers)
 
         self.decode_graph_runners = defaultdict(dict[bool, CUDAGraphRunner])
-        self.norm = LlamaRMSNorm(config.text_config.hidden_size, eps=config.text_config.rms_norm_eps)
+        self.norm = LlamaRMSNorm(
+            config.text_config.hidden_size, eps=config.text_config.rms_norm_eps
+        )
         self.rotary_emb = LlamaRotaryEmbedding(config=config.text_config)
 
         if not config.skip_audio_tower:
@@ -885,18 +1121,23 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
         else:
             self.audio_tower = None
             self.audio_encoder_proj = None
-        self.audio_decoder_proj = HiggsAudioDecoderProjector(config, layer_idx=layer_idx)
+        self.audio_decoder_proj = HiggsAudioDecoderProjector(
+            config, layer_idx=layer_idx
+        )
         self.audio_codebook_size = (
             config.audio_codebook_size + 2
         )  # We add 1 for the audio_stream_bos token and 1 for the audio_stream_eos token
 
         if config.use_audio_out_embed_projector:
             self.audio_out_embed_projector = nn.Linear(
-                config.text_config.hidden_size, config.text_config.hidden_size, bias=False
+                config.text_config.hidden_size,
+                config.text_config.hidden_size,
+                bias=False,
             )
 
         self.audio_codebook_embeddings = nn.Embedding(
-            config.audio_num_codebooks * self.audio_codebook_size, config.text_config.hidden_size
+            config.audio_num_codebooks * self.audio_codebook_size,
+            config.text_config.hidden_size,
         )
 
         self.audio_codebook_weights = (
@@ -912,7 +1153,9 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
         self.use_delay_pattern = True
 
     def set_audio_special_tokens(self, tokenizer: AutoTokenizer):
-        self.audio_out_bos_token_id = tokenizer.convert_tokens_to_ids("<|audio_out_bos|>")
+        self.audio_out_bos_token_id = tokenizer.convert_tokens_to_ids(
+            "<|audio_out_bos|>"
+        )
         self.audio_eos_token_id = tokenizer.convert_tokens_to_ids("<|audio_eos|>")
 
     def _embed_audio_ids(self, audio_ids):
@@ -925,9 +1168,12 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
             audio_embed: torch.LongTensor of shape (audio_in_total_length, hidden_size)
         """
         codebook_shift = (
-            torch.arange(self.config.audio_num_codebooks, device=audio_ids.device) * self.audio_codebook_size
+            torch.arange(self.config.audio_num_codebooks, device=audio_ids.device)
+            * self.audio_codebook_size
         )
-        audio_embed = self.audio_codebook_embeddings(audio_ids + codebook_shift.unsqueeze(-1))
+        audio_embed = self.audio_codebook_embeddings(
+            audio_ids + codebook_shift.unsqueeze(-1)
+        )
         if self.config.audio_embed_avg:
             audio_embed = torch.mean(audio_embed, dim=0)
         else:
@@ -945,7 +1191,10 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
                 # This is a hack to ensure that the forward+backward pass of audio_tower and audio_encoder_proj get triggered.
                 # The monkey patch won't overwrite the backward pass of nn.Module.
                 audio_outputs = _whisper_encoder_zero_shape_forward(
-                    self.audio_tower, audio_features, attention_mask=None, check_seq_length=False
+                    self.audio_tower,
+                    audio_features,
+                    attention_mask=None,
+                    check_seq_length=False,
                 )
                 selected_audio_feature = audio_outputs.last_hidden_state
                 audio_features_embed = self.audio_encoder_proj(selected_audio_feature)
@@ -954,14 +1203,21 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
             else:
                 return None, None
 
-        audio_feat_lengths, audio_feat_out_lengths = self.audio_tower._get_feat_extract_output_lengths(
-            audio_feature_attention_mask.sum(-1)
+        audio_feat_lengths, audio_feat_out_lengths = (
+            self.audio_tower._get_feat_extract_output_lengths(
+                audio_feature_attention_mask.sum(-1)
+            )
         )
         batch_size, _, max_mel_seq_len = audio_features.shape
         max_seq_len = (max_mel_seq_len - 1) // 2 + 1
         # Create a sequence tensor of shape (batch_size, max_seq_len)
         seq_range = (
-            torch.arange(0, max_seq_len, dtype=audio_feat_lengths.dtype, device=audio_feat_lengths.device)
+            torch.arange(
+                0,
+                max_seq_len,
+                dtype=audio_feat_lengths.dtype,
+                device=audio_feat_lengths.device,
+            )
             .unsqueeze(0)
             .expand(batch_size, max_seq_len)
         )
@@ -970,13 +1226,15 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
         padding_mask = seq_range < lengths_expand
 
         if self.config._attn_implementation != "flash_attention_2":
-            audio_attention_mask = padding_mask.view(batch_size, 1, 1, max_seq_len).expand(
-                batch_size, 1, max_seq_len, max_seq_len
-            )
+            audio_attention_mask = padding_mask.view(
+                batch_size, 1, 1, max_seq_len
+            ).expand(batch_size, 1, max_seq_len, max_seq_len)
         else:
             audio_attention_mask = padding_mask
 
-        audio_outputs = self.audio_tower(audio_features, attention_mask=audio_attention_mask)
+        audio_outputs = self.audio_tower(
+            audio_features, attention_mask=audio_attention_mask
+        )
         selected_audio_feature = audio_outputs.last_hidden_state
         audio_features_embed = self.audio_encoder_proj(selected_audio_feature)
 
@@ -998,11 +1256,24 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
         # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
         # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
         # to infer the attention mask.
-        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-        using_static_cache = isinstance(past_key_values, StaticCache)
+        past_seen_tokens = (
+            past_key_values.get_seq_length() if past_key_values is not None else 0
+        )
+        # Treat static cache as usable only when it reports a non-zero max length.
+        using_static_cache = False
+        if isinstance(past_key_values, StaticCache):
+            try:
+                max_len = _get_cache_max_length(past_key_values)
+                using_static_cache = max_len is not None and int(max_len) > 0
+            except Exception:
+                using_static_cache = False
 
         # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
-        if self.config._attn_implementation == "sdpa" and not using_static_cache and not output_attentions:
+        if (
+            self.config._attn_implementation == "sdpa"
+            and not using_static_cache
+            and not output_attentions
+        ):
             if AttentionMaskConverter._ignore_causal_mask_sdpa(
                 attention_mask,
                 inputs_embeds=input_tensor,
@@ -1015,7 +1286,7 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
         min_dtype = torch.finfo(dtype).min
         sequence_length = input_tensor.shape[1]
         if using_static_cache:
-            target_length = past_key_values.get_max_length()
+            target_length = _get_cache_max_length(past_key_values)
         else:
             target_length = (
                 attention_mask.shape[-1]
@@ -1044,22 +1315,30 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
             # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
             # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
             # Details: https://github.com/pytorch/pytorch/issues/110213
-            causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
+            causal_mask = AttentionMaskConverter._unmask_unattended(
+                causal_mask, min_dtype
+            )
 
         return causal_mask
 
-    def _prepare_all_static_kv_cache_masks(self, hidden_states, attention_mask, audio_out_mask, past_key_values):
+    def _prepare_all_static_kv_cache_masks(
+        self, hidden_states, attention_mask, audio_out_mask, past_key_values
+    ):
         target_length = hidden_states.shape[1]
         cur_pos = audio_out_mask.shape[1]
         min_dtype = torch.finfo(hidden_states.dtype).min
         assert len(attention_mask.shape) == 4, "Only support SDPA for now"
-        kv_cache_len = past_key_values.get_max_length()
-        audio_out_mask_padded = torch.nn.functional.pad(audio_out_mask, (0, kv_cache_len - cur_pos), value=True)
+        kv_cache_len = _get_cache_max_length(past_key_values)
+        audio_out_mask_padded = torch.nn.functional.pad(
+            audio_out_mask, (0, kv_cache_len - cur_pos), value=True
+        )
         fast_forward_attention_mask = attention_mask.masked_fill(
-            audio_out_mask_padded[:, audio_out_mask.shape[1] - target_length : audio_out_mask.shape[1]].reshape(
-                audio_out_mask_padded.shape[0], 1, target_length, 1
-            )
-            | audio_out_mask_padded.reshape(audio_out_mask_padded.shape[0], 1, 1, audio_out_mask_padded.shape[1]),
+            audio_out_mask_padded[
+                :, audio_out_mask.shape[1] - target_length : audio_out_mask.shape[1]
+            ].reshape(audio_out_mask_padded.shape[0], 1, target_length, 1)
+            | audio_out_mask_padded.reshape(
+                audio_out_mask_padded.shape[0], 1, 1, audio_out_mask_padded.shape[1]
+            ),
             min_dtype,
         )
 
@@ -1069,9 +1348,9 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
         )
         no_audio_out_mask = no_audio_out_mask[
             :, audio_out_mask.shape[1] - target_length : audio_out_mask.shape[1]
-        ].reshape(audio_out_mask.shape[0], 1, target_length, 1) | no_audio_out_mask.reshape(
-            audio_out_mask.shape[0], 1, 1, kv_cache_len
-        )
+        ].reshape(
+            audio_out_mask.shape[0], 1, target_length, 1
+        ) | no_audio_out_mask.reshape(audio_out_mask.shape[0], 1, 1, kv_cache_len)
         audio_attention_mask = attention_mask.masked_fill(no_audio_out_mask, min_dtype)
         return fast_forward_attention_mask, audio_attention_mask
 
@@ -1095,7 +1374,9 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
         # When past_key_values is passed in, we need to offset the position ids when calculating the position embeddings.
         # Therefore, cache_position is used.
         position_id_offset = cache_position[0] if use_cache else 0
-        position_embeddings = self.rotary_emb(hidden_states, position_ids + position_id_offset)
+        position_embeddings = self.rotary_emb(
+            hidden_states, position_ids + position_id_offset
+        )
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -1219,7 +1500,9 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
 
         if audio_features is not None:
             audio_features = audio_features.to(target_device)
-            audio_feature_attention_mask = audio_feature_attention_mask.to(target_device)
+            audio_feature_attention_mask = audio_feature_attention_mask.to(
+                target_device
+            )
 
         # 1. Extract the input embeddings
         inputs_embeds = self.embed_tokens(input_ids)
@@ -1236,7 +1519,11 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
             if audio_in_ids is not None and audio_in_ids.shape[-1] > 0:
                 audio_in_ids = audio_in_ids.to(target_device)
             else:
-                audio_in_ids = torch.zeros((self.audio_num_codebooks, 0), device=target_device, dtype=torch.long)
+                audio_in_ids = torch.zeros(
+                    (self.audio_num_codebooks, 0),
+                    device=target_device,
+                    dtype=torch.long,
+                )
             audio_in_embed = self._embed_audio_ids(audio_in_ids)
         else:
             audio_in_embed = None
@@ -1244,7 +1531,9 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
         if audio_out_ids is not None and audio_out_ids.shape[-1] > 0:
             audio_out_ids = audio_out_ids.to(target_device)
         else:
-            audio_out_ids = torch.zeros((self.audio_num_codebooks, 0), device=target_device, dtype=torch.long)
+            audio_out_ids = torch.zeros(
+                (self.audio_num_codebooks, 0), device=target_device, dtype=torch.long
+            )
         audio_out_embed = self._embed_audio_ids(audio_out_ids)
 
         # 3. Merge text, audio-in embeddings, and audio-out embeddings
@@ -1281,32 +1570,67 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
 
         # re-check if we use the correct kv cache bucket after
         # the input_embeds has been merged with audio features
-        if past_key_values_buckets is not None and inputs_embeds.shape[1] > past_key_values.get_max_length():
-            past_key_values, self.current_past_key_values_bucket = self._prepare_kv_cache(
-                inputs_embeds.shape[1], None, past_key_values_buckets
+        if past_key_values_buckets is not None and inputs_embeds.shape[
+            1
+        ] > _get_cache_max_length(past_key_values):
+            past_key_values, self.current_past_key_values_bucket = (
+                self._prepare_kv_cache(
+                    inputs_embeds.shape[1], None, past_key_values_buckets
+                )
             )
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache()
 
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            past_seen_tokens = (
+                past_key_values.get_seq_length() if past_key_values is not None else 0
             )
-            if isinstance(past_key_values, StaticCache) and past_seen_tokens >= past_key_values.get_max_length():
-                raise ValueError(
-                    f"The current sequence length ({past_seen_tokens}) exceeds "
-                    f"the maximum cache shape. "
-                    f"Please consider increasing the cache size."
-                )
+            cache_position = torch.arange(
+                past_seen_tokens,
+                past_seen_tokens + inputs_embeds.shape[1],
+                device=inputs_embeds.device,
+            )
+            if isinstance(past_key_values, StaticCache):
+                try:
+                    max_len = _get_cache_max_length(past_key_values)
+                except Exception:
+                    max_len = 0
 
-        # Use torch compile
-        use_static_cache = isinstance(past_key_values, StaticCache)
+                # If the cache reports 0 it is likely uninitialized in this
+                # runtime/version combination. Instead of failing hard, log a
+                # warning and continue (generation will use dynamic path when
+                # appropriate). If max_len is nonzero we keep the original check.
+                if max_len == 0:
+                    logger.warning(
+                        "StaticCache reports max_length=0 (uninitialized). "
+                        "Proceeding without raising; consider initializing or "
+                        "increasing cache size for better performance."
+                    )
+                elif past_seen_tokens >= max_len:
+                    raise ValueError(
+                        f"The current sequence length ({past_seen_tokens}) exceeds "
+                        f"the maximum cache shape. "
+                        f"Please consider increasing the cache size."
+                    )
+
+        # Use torch compile. Only enable static-cache code paths when the cache
+        # reports a usable (non-zero) max length.
+        use_static_cache = False
+        if isinstance(past_key_values, StaticCache):
+            try:
+                max_len = _get_cache_max_length(past_key_values)
+                use_static_cache = max_len is not None and int(max_len) > 0
+            except Exception:
+                use_static_cache = False
 
         # Apply the LLM component
         causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+            attention_mask,
+            inputs_embeds,
+            cache_position,
+            past_key_values,
+            output_attentions,
         )
 
         hidden_states = inputs_embeds
@@ -1319,26 +1643,46 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
 
         # Generate the audio attention mask outside the layer to avoid recompilation
         if use_static_cache:
-            fast_forward_attention_mask, audio_attention_mask = self._prepare_all_static_kv_cache_masks(
-                hidden_states, causal_mask, audio_discrete_codes_mask, past_key_values
+            fast_forward_attention_mask, audio_attention_mask = (
+                self._prepare_all_static_kv_cache_masks(
+                    hidden_states,
+                    causal_mask,
+                    audio_discrete_codes_mask,
+                    past_key_values,
+                )
             )
             # Set the audio out mask to the last token
             if hidden_states.shape[1] == 1:
                 audio_discrete_codes_mask = audio_discrete_codes_mask[:, -1:]
-                audio_discrete_codes_mask = audio_discrete_codes_mask.reshape((-1, 1)).contiguous()
+                audio_discrete_codes_mask = audio_discrete_codes_mask.reshape(
+                    (-1, 1)
+                ).contiguous()
                 is_decoding_audio_token = audio_discrete_codes_mask.item()
             else:
                 is_decoding_audio_token = False
 
         # Use the captured cuda graph runner for decoding
         # if it exists, otherwise use the normal forward pass
-        if (
-            past_key_values is not None
-            and past_key_values.get_max_length() in self.decode_graph_runners
-            and (input_ids.shape[-1] == 1)
-        ):
-            _forward_core = self.decode_graph_runners[past_key_values.get_max_length()][is_decoding_audio_token]
-            is_using_cuda_graph = True
+        if past_key_values is not None and (input_ids.shape[-1] == 1):
+            try:
+                cache_len_for_runner = _get_cache_max_length(past_key_values)
+            except Exception:
+                cache_len_for_runner = None
+
+            # Only use the cuda graph runner when a runner for this cache length
+            # and decoding flag exists. Otherwise fall back to the normal forward.
+            if (
+                cache_len_for_runner is not None
+                and cache_len_for_runner in self.decode_graph_runners
+                and is_decoding_audio_token in self.decode_graph_runners[cache_len_for_runner]
+            ):
+                _forward_core = self.decode_graph_runners[cache_len_for_runner][
+                    is_decoding_audio_token
+                ]
+                is_using_cuda_graph = True
+            else:
+                _forward_core = self._forward_core
+                is_using_cuda_graph = False
         else:
             _forward_core = self._forward_core
             is_using_cuda_graph = False
@@ -1348,12 +1692,16 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
             causal_mask=causal_mask,
             position_ids=position_ids,
             audio_discrete_codes_mask=audio_discrete_codes_mask,
-            is_decoding_audio_token=is_decoding_audio_token if use_static_cache else None,
+            is_decoding_audio_token=is_decoding_audio_token
+            if use_static_cache
+            else None,
             cache_position=cache_position,
             past_key_values=past_key_values,
             use_cache=use_cache,
             audio_attention_mask=audio_attention_mask if use_static_cache else None,
-            fast_forward_attention_mask=fast_forward_attention_mask if use_static_cache else None,
+            fast_forward_attention_mask=fast_forward_attention_mask
+            if use_static_cache
+            else None,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             is_using_cuda_graph=is_using_cuda_graph,
@@ -1365,28 +1713,38 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
             all_hidden_states += (hidden_states,)
 
         # Apply the audio decoder projector
-        logits, audio_logits, decoder_all_self_attns, decoder_all_hidden_states, audio_hidden_states, _ = (
-            self.audio_decoder_proj(
-                hidden_states,
-                audio_out_mask,
-                label_audio_ids=label_audio_ids,
-                attention_mask=causal_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_audio_hidden_states=output_audio_hidden_states,
-                cache_position=cache_position,
-            )
+        (
+            logits,
+            audio_logits,
+            decoder_all_self_attns,
+            decoder_all_hidden_states,
+            audio_hidden_states,
+            _,
+        ) = self.audio_decoder_proj(
+            hidden_states,
+            audio_out_mask,
+            label_audio_ids=label_audio_ids,
+            attention_mask=causal_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_audio_hidden_states=output_audio_hidden_states,
+            cache_position=cache_position,
         )
 
         if audio_logits is not None:
             audio_logits = audio_logits.view(
-                audio_logits.shape[0], self.audio_num_codebooks, self.audio_codebook_size
+                audio_logits.shape[0],
+                self.audio_num_codebooks,
+                self.audio_codebook_size,
             ).float()
 
         if output_hidden_states:
-            if decoder_all_hidden_states is not None and len(decoder_all_hidden_states) > 1:
+            if (
+                decoder_all_hidden_states is not None
+                and len(decoder_all_hidden_states) > 1
+            ):
                 all_hidden_states += decoder_all_hidden_states[1:]
 
         if output_attentions:
@@ -1409,7 +1767,9 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
             attentions=all_self_attns,
         )
 
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
         if not return_dict:
             outputs = ret.to_tuple()
             return outputs
@@ -1433,7 +1793,11 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
             attention_mask = model_kwargs["attention_mask"]
             if extend_attention_mask:
                 model_kwargs["attention_mask"] = torch.cat(
-                    [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+                    [
+                        attention_mask,
+                        attention_mask.new_ones((attention_mask.shape[0], 1)),
+                    ],
+                    dim=-1,
                 )
         if "cache_audio_discrete_codes_mask" in model_kwargs:
             if model_kwargs["cache_audio_discrete_codes_mask"] is None:
@@ -1457,12 +1821,16 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
             num_layers += len(self.config.audio_dual_ffn_layers)
         """ Copy the key-value pairs from one cache to another. """
         for layer_idx in range(num_layers):
-            from_cache_size = from_cache.get_max_length()
-            assert to_cache.get_max_length() >= from_cache_size, (
-                f"The target cache size {to_cache.get_max_length()} is smaller than the source cache size {from_cache_size}."
+            from_cache_size = _get_cache_max_length(from_cache)
+            assert _get_cache_max_length(to_cache) >= from_cache_size, (
+                f"The target cache size {_get_cache_max_length(to_cache)} is smaller than the source cache size {from_cache_size}."
             )
-            to_cache.key_cache[layer_idx][:, :, :from_cache_size, :] = from_cache.key_cache[layer_idx]
-            to_cache.value_cache[layer_idx][:, :, :from_cache_size, :] = from_cache.value_cache[layer_idx]
+            to_cache.key_cache[layer_idx][:, :, :from_cache_size, :] = (
+                from_cache.key_cache[layer_idx]
+            )
+            to_cache.value_cache[layer_idx][:, :, :from_cache_size, :] = (
+                from_cache.value_cache[layer_idx]
+            )
 
     def _prepare_kv_cache(
         self,
@@ -1475,9 +1843,13 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
             if cache_length >= current_sequence_length:
                 # Promote to the next KV cache bucket, copy the current KV cache bucket
                 # to the new one.
-                if current_past_key_values_bucket is not None and cache_length != current_past_key_values_bucket:
+                if (
+                    current_past_key_values_bucket is not None
+                    and cache_length != current_past_key_values_bucket
+                ):
                     self._copy_kv_cache(
-                        past_key_values_buckets[current_past_key_values_bucket], past_key_values_buckets[cache_length]
+                        past_key_values_buckets[current_past_key_values_bucket],
+                        past_key_values_buckets[cache_length],
                     )
 
                 return past_key_values_buckets[cache_length], cache_length
@@ -1499,13 +1871,19 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
         generation_config: GenerationConfig,
         num_delay: int,
         num_remaining_delays: Optional[int],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, Optional[int]]:
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, Optional[int]
+    ]:
         """Sample audio tokens and its corresponding text tokens from the logits"""
 
         # parameters related to repetition aware sampling
         ras_win_len = generation_config.generation_kwargs.get("ras_win_len", None)
-        ras_win_max_num_repeat = generation_config.generation_kwargs.get("ras_win_max_num_repeat", 2)
-        audio_eos_token_id = generation_config.generation_kwargs.get("audio_eos_token_id", None)
+        ras_win_max_num_repeat = generation_config.generation_kwargs.get(
+            "ras_win_max_num_repeat", 2
+        )
+        audio_eos_token_id = generation_config.generation_kwargs.get(
+            "audio_eos_token_id", None
+        )
         # In the audio generation mode, we sample from audio_logits and keep updating audio_out_ids.
         next_audio_token_logits = audio_logits.clone()[-1, :, :].float().to(device)
         # TopP, TopK logits processor supports empty input_ids
@@ -1516,14 +1894,18 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
             # next_audio_token_scores has been applied top_p, top_k, and temperature.
             probs = nn.functional.softmax(next_audio_token_scores, dim=-1)
             # TODO (joao): this OP throws "skipping cudagraphs due to ['incompatible ops']", find solution
-            next_audio_tokens = torch.multinomial(probs, num_samples=1, generator=torch_generator).squeeze(1)
+            next_audio_tokens = torch.multinomial(
+                probs, num_samples=1, generator=torch_generator
+            ).squeeze(1)
         else:
             next_audio_tokens = torch.argmax(next_audio_token_scores, dim=-1)
 
         # next_tokens: (num_codebooks, )
         if ras_win_len is not None:
             # check if there are repetitions over a window of tokens.
-            rep_num = (audio_out_ids[:, -ras_win_len:] == next_audio_tokens.unsqueeze(1)).sum(dim=1)
+            rep_num = (
+                audio_out_ids[:, -ras_win_len:] == next_audio_tokens.unsqueeze(1)
+            ).sum(dim=1)
 
             # if we saw repeated tokens in the most recent window of tokens, resample without temperature.
             row_indices = torch.nonzero(rep_num >= ras_win_max_num_repeat).squeeze(1)
@@ -1549,12 +1931,14 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
                 next_audio_tokens[(num_delay + 1) :] = self.config.audio_stream_bos_id
                 num_delay += 1
             if num_remaining_delays is not None:
-                next_audio_tokens[: (self.audio_num_codebooks - num_remaining_delays)] = (
-                    self.config.audio_stream_eos_id
-                )
+                next_audio_tokens[
+                    : (self.audio_num_codebooks - num_remaining_delays)
+                ] = self.config.audio_stream_eos_id
                 num_remaining_delays -= 1
             else:
-                all_eos_indices = (next_audio_tokens == self.config.audio_stream_eos_id).nonzero()
+                all_eos_indices = (
+                    next_audio_tokens == self.config.audio_stream_eos_id
+                ).nonzero()
                 if torch.numel(all_eos_indices) > 0:
                     all_eos_indices = all_eos_indices[0]
                     last_eos_idx = all_eos_indices[-1]
@@ -1611,7 +1995,9 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
             if do_sample:
                 probs = nn.functional.softmax(next_token_scores, dim=-1)
                 # TODO (joao): this OP throws "skipping cudagraphs due to ['incompatible ops']", find solution
-                next_tokens = torch.multinomial(probs, num_samples=1, generator=torch_generator).squeeze(1)
+                next_tokens = torch.multinomial(
+                    probs, num_samples=1, generator=torch_generator
+                ).squeeze(1)
             else:
                 next_tokens = torch.argmax(next_token_scores, dim=-1)
 
@@ -1627,9 +2013,8 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
         logits_processor: LogitsProcessorList,
         stopping_criteria: StoppingCriteriaList,
         generation_config: GenerationConfig,
-        synced_gpus: bool,
-        streamer: Optional["BaseStreamer"],
-        past_key_values_buckets: Optional[OrderedDict[int, Cache]],
+        synced_gpus: bool = False,
+        streamer: Optional["BaseStreamer"] = None,
         **model_kwargs,
     ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
         r"""
@@ -1673,7 +2058,17 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
             `model.config.is_encoder_decoder=True`.
         """
         assert input_ids.shape[0] == 1, "Only support batch_size=1 in _sample()"
-        audio_out_bos_token_id = generation_config.generation_kwargs.get("audio_out_bos_token_id", None)
+
+        # Extract past_key_values_buckets from model_kwargs (compatibility fix for newer transformers)
+        past_key_values_buckets = model_kwargs.pop("past_key_values_buckets", None)
+
+        # Remove tokenizer from model_kwargs as it's not a valid forward() parameter
+        # It's stored in generation_config for reference only
+        model_kwargs.pop("tokenizer", None)
+
+        audio_out_bos_token_id = generation_config.generation_kwargs.get(
+            "audio_out_bos_token_id", None
+        )
 
         # torch generator for sampling
         seed = generation_config.generation_kwargs.get("seed", None)
@@ -1683,14 +2078,16 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
             torch_generator = None
 
         # init values
-        pad_token_id = generation_config._pad_token_tensor
+        pad_token_id = _get_pad_token_tensor(generation_config)
         output_attentions = generation_config.output_attentions
         output_hidden_states = generation_config.output_hidden_states
         output_scores = generation_config.output_scores
         output_logits = generation_config.output_logits
         return_dict_in_generate = generation_config.return_dict_in_generate
         max_length = generation_config.max_length
-        has_eos_stopping_criteria = any(hasattr(criteria, "eos_token_id") for criteria in stopping_criteria)
+        has_eos_stopping_criteria = any(
+            hasattr(criteria, "eos_token_id") for criteria in stopping_criteria
+        )
         do_sample = generation_config.do_sample
         # Used to track which past_key_va
         self.current_past_key_values_bucket = None
@@ -1699,13 +2096,19 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
         scores = () if (return_dict_in_generate and output_scores) else None
         raw_logits = () if (return_dict_in_generate and output_logits) else None
 
-        decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
-        decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
+        decoder_attentions = (
+            () if (return_dict_in_generate and output_attentions) else None
+        )
+        decoder_hidden_states = (
+            () if (return_dict_in_generate and output_hidden_states) else None
+        )
 
         # keep track of which sequences are already finished
         batch_size, cur_len = input_ids.shape
         this_peer_finished = False
-        unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
+        unfinished_sequences = torch.ones(
+            batch_size, dtype=torch.long, device=input_ids.device
+        )
         if generation_config.use_cache:
             model_kwargs["cache_audio_discrete_codes_mask"] = None
 
@@ -1718,20 +2121,36 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
 
         # Initialize the audio variables based on the input prompt.
         if input_ids[0][-1] == self.config.audio_out_token_idx:
-            audio_sequences = [model_kwargs["audio_out_ids"][:, model_kwargs["audio_out_ids_start"][-1] :]]
+            audio_sequences = [
+                model_kwargs["audio_out_ids"][
+                    :, model_kwargs["audio_out_ids_start"][-1] :
+                ]
+            ]
             if self.use_delay_pattern:
                 num_delay = (
                     self.audio_num_codebooks
-                    - (model_kwargs["audio_out_ids"][:, -1] == self.config.audio_stream_bos_id).sum()
+                    - (
+                        model_kwargs["audio_out_ids"][:, -1]
+                        == self.config.audio_stream_bos_id
+                    ).sum()
                 )
-                all_eos_indices = (model_kwargs["audio_out_ids"][:, -1] == self.config.audio_stream_eos_id).nonzero()
+                all_eos_indices = (
+                    model_kwargs["audio_out_ids"][:, -1]
+                    == self.config.audio_stream_eos_id
+                ).nonzero()
                 if torch.numel(all_eos_indices) > 0:
                     all_eos_indices = all_eos_indices[0]
                     last_eos_idx = all_eos_indices[-1]
                     num_remaining_delays = self.audio_num_codebooks - last_eos_idx - 1
 
-        while self._has_unfinished_sequences(
-            this_peer_finished, synced_gpus, device=input_ids.device, cur_len=cur_len, max_length=max_length
+        # Compatibility fix for newer transformers: _has_unfinished_sequences no longer accepts cur_len and max_length
+        while (
+            self._has_unfinished_sequences(
+                this_peer_finished,
+                synced_gpus,
+                device=input_ids.device,
+            )
+            and cur_len < max_length
         ):
             # Check which multimodal stage we are in
             # FIXME: Assume single input generation
@@ -1742,7 +2161,9 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
             else:
                 generation_mode = GenerationMode.TEXT
 
-            is_audio_generation_mode = generation_mode == GenerationMode.AUDIO_IN_PROGRESS
+            is_audio_generation_mode = (
+                generation_mode == GenerationMode.AUDIO_IN_PROGRESS
+            )
 
             if init_model_input or not generation_config.use_cache:
                 model_inputs = {"input_ids": input_ids, **model_kwargs}
@@ -1750,30 +2171,52 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
                 model_inputs = {"input_ids": input_ids[:, -1:], **model_kwargs}
 
                 if is_audio_generation_mode and generation_config.use_cache:
-                    model_inputs["audio_out_ids"] = model_kwargs["audio_out_ids"][:, -1:]
-                    model_inputs["audio_out_ids_start"] = torch.tensor([0], dtype=torch.long, device=input_ids.device)
+                    model_inputs["audio_out_ids"] = model_kwargs["audio_out_ids"][
+                        :, -1:
+                    ]
+                    model_inputs["audio_out_ids_start"] = torch.tensor(
+                        [0], dtype=torch.long, device=input_ids.device
+                    )
                 elif not is_audio_generation_mode:
                     del model_inputs["audio_out_ids"]
                     del model_inputs["audio_out_ids_start"]
 
                 if generation_config.use_cache:
-                    if "audio_features" in model_inputs and model_inputs["audio_features"] is not None:
-                        model_inputs["audio_features"] = model_inputs["audio_features"][:0, ...]
-                        model_inputs["audio_feature_attention_mask"] = model_inputs["audio_feature_attention_mask"][
+                    if (
+                        "audio_features" in model_inputs
+                        and model_inputs["audio_features"] is not None
+                    ):
+                        model_inputs["audio_features"] = model_inputs["audio_features"][
                             :0, ...
                         ]
+                        model_inputs["audio_feature_attention_mask"] = model_inputs[
+                            "audio_feature_attention_mask"
+                        ][:0, ...]
 
-                    if "audio_in_ids" in model_inputs and model_inputs["audio_in_ids"] is not None:
+                    if (
+                        "audio_in_ids" in model_inputs
+                        and model_inputs["audio_in_ids"] is not None
+                    ):
                         model_inputs["audio_in_ids"] = None
                         model_inputs["audio_in_ids_start"] = None
 
             # prepare variable output controls (note: some models won't accept all output controls)
-            model_inputs.update({"output_attentions": output_attentions} if output_attentions else {})
-            model_inputs.update({"output_hidden_states": output_hidden_states} if output_hidden_states else {})
+            model_inputs.update(
+                {"output_attentions": output_attentions} if output_attentions else {}
+            )
+            model_inputs.update(
+                {"output_hidden_states": output_hidden_states}
+                if output_hidden_states
+                else {}
+            )
 
             if past_key_values_buckets is not None:
-                past_key_values, self.current_past_key_values_bucket = self._prepare_kv_cache(
-                    cur_len, self.current_past_key_values_bucket, past_key_values_buckets
+                past_key_values, self.current_past_key_values_bucket = (
+                    self._prepare_kv_cache(
+                        cur_len,
+                        self.current_past_key_values_bucket,
+                        past_key_values_buckets,
+                    )
                 )
                 if past_key_values is not None:
                     model_inputs.update({"past_key_values": past_key_values})
@@ -1784,7 +2227,11 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
 
             # Update the actual sequence length after the first forward pass
             if init_model_input and past_key_values_buckets is not None:
-                cur_len = past_key_values_buckets[self.current_past_key_values_bucket].get_seq_length().item()
+                cur_len = (
+                    past_key_values_buckets[self.current_past_key_values_bucket]
+                    .get_seq_length()
+                    .item()
+                )
 
             # synced_gpus: don't waste resources running the code we don't need; kwargs must be updated before skipping
             model_kwargs = self._update_model_kwargs_for_generation(
@@ -1827,21 +2274,25 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
                 model_kwargs["audio_out_ids"] = torch.cat(
                     [model_kwargs["audio_out_ids"], next_audio_tokens[:, None]], dim=-1
                 )
-                audio_sequences[-1] = torch.cat([audio_sequences[-1], next_audio_tokens[:, None]], dim=-1)
+                audio_sequences[-1] = torch.cat(
+                    [audio_sequences[-1], next_audio_tokens[:, None]], dim=-1
+                )
 
                 if streamer is not None:
                     streamer.put(next_audio_tokens.cpu())
             else:
                 # In text generation mode, we sample the text tokens from text logits.
                 # It might also generate the audio placeholder token to start the audio generation.
-                next_tokens, next_audio_tokens, next_token_logits, next_token_scores = self._sample_text_tokens(
-                    input_ids=input_ids,
-                    logits=outputs.logits,
-                    do_sample=do_sample,
-                    logits_processor=logits_processor,
-                    device=input_ids.device,
-                    generation_mode=generation_mode,
-                    torch_generator=torch_generator,
+                next_tokens, next_audio_tokens, next_token_logits, next_token_scores = (
+                    self._sample_text_tokens(
+                        input_ids=input_ids,
+                        logits=outputs.logits,
+                        do_sample=do_sample,
+                        logits_processor=logits_processor,
+                        device=input_ids.device,
+                        generation_mode=generation_mode,
+                        torch_generator=torch_generator,
+                    )
                 )
 
                 if streamer is not None:
@@ -1853,7 +2304,10 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
                     audio_sequences.append(next_audio_tokens[:, None])
                     if streamer is not None:
                         streamer.put(next_audio_tokens.cpu())
-                    if model_kwargs["audio_out_ids"] is None or model_kwargs["audio_out_ids"].shape[0] == 0:
+                    if (
+                        model_kwargs["audio_out_ids"] is None
+                        or model_kwargs["audio_out_ids"].shape[0] == 0
+                    ):
                         # Initialize audio_out_ids
                         model_kwargs["audio_out_ids"] = next_audio_tokens[:, None]
                         model_kwargs["audio_out_ids_start"] = torch.tensor(
@@ -1864,13 +2318,16 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
                             [
                                 model_kwargs["audio_out_ids_start"],
                                 torch.tensor(
-                                    [model_kwargs["audio_out_ids"].shape[1]], dtype=torch.long, device=input_ids.device
+                                    [model_kwargs["audio_out_ids"].shape[1]],
+                                    dtype=torch.long,
+                                    device=input_ids.device,
                                 ),
                             ],
                             dim=0,
                         )
                         model_kwargs["audio_out_ids"] = torch.concat(
-                            [model_kwargs["audio_out_ids"], next_audio_tokens[:, None]], dim=1
+                            [model_kwargs["audio_out_ids"], next_audio_tokens[:, None]],
+                            dim=1,
                         )
 
             if return_dict_in_generate:
@@ -1891,21 +2348,30 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
 
             # finished sentences should have their next token be a padding token
             if has_eos_stopping_criteria:
-                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (
+                    1 - unfinished_sequences
+                )
 
             if "tokenizer_length" in generation_config.generation_kwargs:
-                tokenizer_length = generation_config.generation_kwargs["tokenizer_length"]
+                tokenizer_length = generation_config.generation_kwargs[
+                    "tokenizer_length"
+                ]
                 if torch.max(next_tokens) >= tokenizer_length:
                     raise ValueError(
                         f"Next generated token has max value {torch.max(next_tokens)} which is greater than the tokenizer's vocabulary size {tokenizer_length}, this is undesired behavior."
                     )
 
             # update generated ids, model inputs, and length for next step
-            if not is_audio_generation_mode or next_tokens[0] != self.audio_out_token_idx:
+            if (
+                not is_audio_generation_mode
+                or next_tokens[0] != self.audio_out_token_idx
+            ):
                 # We only add one <|AUDIO_OUT|> token to the input_ids for simplicity.
                 input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
             input_ids_full = torch.cat([input_ids_full, next_tokens[:, None]], dim=-1)
-            unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids_full, scores)
+            unfinished_sequences = unfinished_sequences & ~stopping_criteria(
+                input_ids_full, scores
+            )
             this_peer_finished = unfinished_sequences.max() == 0
             cur_len += 1
 
@@ -1957,35 +2423,62 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
         assert input_ids.shape[0] == 1, (
             "Currently HiggsAudioModel.generate() only supports batch_size=1. See the implementation of "
         )
-        generation_config, kwargs = self._prepare_generation_config(kwargs.pop("generation_config", None), **kwargs)
+        generation_config, kwargs = self._prepare_generation_config(
+            kwargs.pop("generation_config", None), **kwargs
+        )
+
+        # Initialize generation_kwargs if it doesn't exist (compatibility fix for newer transformers)
+        if not hasattr(generation_config, "generation_kwargs"):
+            generation_config.generation_kwargs = {}
+
         if audio_out_bos_token_id is not None:
-            generation_config.generation_kwargs["audio_out_bos_token_id"] = audio_out_bos_token_id
+            generation_config.generation_kwargs["audio_out_bos_token_id"] = (
+                audio_out_bos_token_id
+            )
         else:
             try:
-                generation_config.generation_kwargs["audio_out_bos_token_id"] = self.audio_out_bos_token_id
+                generation_config.generation_kwargs["audio_out_bos_token_id"] = (
+                    self.audio_out_bos_token_id
+                )
             except:
                 generation_config.generation_kwargs["audio_out_bos_token_id"] = None
 
         if audio_eos_token_id is not None:
-            generation_config.generation_kwargs["audio_eos_token_id"] = audio_eos_token_id
+            generation_config.generation_kwargs["audio_eos_token_id"] = (
+                audio_eos_token_id
+            )
         else:
             try:
-                generation_config.generation_kwargs["audio_eos_token_id"] = self.audio_eos_token_id
+                generation_config.generation_kwargs["audio_eos_token_id"] = (
+                    self.audio_eos_token_id
+                )
             except:
                 generation_config.generation_kwargs["audio_eos_token_id"] = None
 
-        has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
-        has_default_min_length = kwargs.get("min_length") is None and generation_config.min_length is not None
+        has_default_max_length = (
+            kwargs.get("max_length") is None
+            and generation_config.max_length is not None
+        )
+        has_default_min_length = (
+            kwargs.get("min_length") is None
+            and generation_config.min_length is not None
+        )
 
-        generation_config.generation_kwargs["ras_win_len"] = kwargs.pop("ras_win_len", None)
-        generation_config.generation_kwargs["ras_win_max_num_repeat"] = kwargs.pop("ras_win_max_num_repeat", 2)
+        generation_config.generation_kwargs["ras_win_len"] = kwargs.pop(
+            "ras_win_len", None
+        )
+        generation_config.generation_kwargs["ras_win_max_num_repeat"] = kwargs.pop(
+            "ras_win_max_num_repeat", 2
+        )
         # Set generation seed if determinstic generation is required
         if seed is not None:
             generation_config.generation_kwargs["seed"] = seed
 
         # Store tokenizer in generation config if it is in kwargs without popping it
         if "tokenizer" in kwargs:
-            generation_config.generation_kwargs["tokenizer_length"] = len(kwargs["tokenizer"])
+            generation_config.generation_kwargs["tokenizer_length"] = len(
+                kwargs["tokenizer"]
+            )
 
         # input_ids: [bsz, seq_len]
         # The merging of audio features happens inside the forward path. The input_ids does not need to change.
@@ -1999,7 +2492,9 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
             inputs_tensor=None,
             input_ids_length=input_ids_length,
         )
-        assert generation_config.num_beams == 1, "Currently, we only support beam search with num_beams=1"
+        assert generation_config.num_beams == 1, (
+            "Currently, we only support beam search with num_beams=1"
+        )
         return_dict_in_generate = generation_config.return_dict_in_generate
         output_scores = generation_config.output_scores
 
@@ -2054,64 +2549,114 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
 
         for mod in [self.audio_tower]:
             if mod is not None:
-                total_stats["audio_tower"] += count_parameters(mod, trainable_only=False)
-                trainable_stats["audio_tower"] += count_parameters(mod, trainable_only=True)
+                total_stats["audio_tower"] += count_parameters(
+                    mod, trainable_only=False
+                )
+                trainable_stats["audio_tower"] += count_parameters(
+                    mod, trainable_only=True
+                )
 
-        total_stats["llm_embed"] = count_parameters(self.embed_tokens, trainable_only=False)
-        trainable_stats["llm_embed"] = count_parameters(self.embed_tokens, trainable_only=True)
+        total_stats["llm_embed"] = count_parameters(
+            self.embed_tokens, trainable_only=False
+        )
+        trainable_stats["llm_embed"] = count_parameters(
+            self.embed_tokens, trainable_only=True
+        )
 
-        total_stats["audio_embed"] = count_parameters(self.audio_codebook_embeddings, trainable_only=False)
-        trainable_stats["audio_embed"] = count_parameters(self.audio_codebook_embeddings, trainable_only=True)
+        total_stats["audio_embed"] = count_parameters(
+            self.audio_codebook_embeddings, trainable_only=False
+        )
+        trainable_stats["audio_embed"] = count_parameters(
+            self.audio_codebook_embeddings, trainable_only=True
+        )
 
         # Calculate number of parameters for LLM
         for layer in self.layers:
             if isinstance(layer, HiggsAudioDualFFNDecoderLayer):
                 total_param_count = count_parameters(layer, trainable_only=False)
-                total_trainable_param_count = count_parameters(layer, trainable_only=True)
+                total_trainable_param_count = count_parameters(
+                    layer, trainable_only=True
+                )
                 total_stats["llm_non_embed"] += total_param_count
                 trainable_stats["llm_non_embed"] += total_trainable_param_count
                 if not layer.fast_forward:
-                    audio_mlp_param_count = count_parameters(layer.audio_mlp, trainable_only=False)
-                    audio_mlp_trainable_param_count = count_parameters(layer.audio_mlp, trainable_only=True)
+                    audio_mlp_param_count = count_parameters(
+                        layer.audio_mlp, trainable_only=False
+                    )
+                    audio_mlp_trainable_param_count = count_parameters(
+                        layer.audio_mlp, trainable_only=True
+                    )
 
                     audio_norm_param_count = count_parameters(
                         layer.audio_post_attention_layernorm, trainable_only=False
-                    ) + count_parameters(layer.audio_input_layernorm, trainable_only=False)
+                    ) + count_parameters(
+                        layer.audio_input_layernorm, trainable_only=False
+                    )
                     audio_norm_trainable_param_count = count_parameters(
                         layer.audio_post_attention_layernorm, trainable_only=True
-                    ) + count_parameters(layer.audio_input_layernorm, trainable_only=True)
-                    total_stats["llm_non_embed"] -= audio_mlp_param_count + audio_norm_param_count
-                    trainable_stats["llm_non_embed"] -= (
-                        audio_mlp_trainable_param_count + audio_norm_trainable_param_count
+                    ) + count_parameters(
+                        layer.audio_input_layernorm, trainable_only=True
                     )
-                    total_stats["audio_adapter"] += audio_mlp_param_count + audio_norm_param_count
+                    total_stats["llm_non_embed"] -= (
+                        audio_mlp_param_count + audio_norm_param_count
+                    )
+                    trainable_stats["llm_non_embed"] -= (
+                        audio_mlp_trainable_param_count
+                        + audio_norm_trainable_param_count
+                    )
+                    total_stats["audio_adapter"] += (
+                        audio_mlp_param_count + audio_norm_param_count
+                    )
                     trainable_stats["audio_adapter"] += (
-                        audio_mlp_trainable_param_count + audio_norm_trainable_param_count
+                        audio_mlp_trainable_param_count
+                        + audio_norm_trainable_param_count
                     )
 
                     if layer.use_audio_attention:
                         audio_attn_param_count = count_parameters(
                             layer.audio_attn, trainable_only=False
-                        ) + count_parameters(layer.audio_post_audio_attn_layer_norm, trainable_only=False)
+                        ) + count_parameters(
+                            layer.audio_post_audio_attn_layer_norm, trainable_only=False
+                        )
                         audio_attn_trainable_param_count = count_parameters(
                             layer.audio_attn, trainable_only=True
-                        ) + count_parameters(layer.audio_post_audio_attn_layer_norm, trainable_only=True)
+                        ) + count_parameters(
+                            layer.audio_post_audio_attn_layer_norm, trainable_only=True
+                        )
                         total_stats["llm_non_embed"] -= audio_attn_param_count
-                        trainable_stats["llm_non_embed"] -= audio_attn_trainable_param_count
+                        trainable_stats["llm_non_embed"] -= (
+                            audio_attn_trainable_param_count
+                        )
                         total_stats["audio_adapter"] += audio_attn_param_count
-                        trainable_stats["audio_adapter"] += audio_attn_trainable_param_count
+                        trainable_stats["audio_adapter"] += (
+                            audio_attn_trainable_param_count
+                        )
             else:
-                total_stats["llm_non_embed"] += count_parameters(layer, trainable_only=False)
-                trainable_stats["llm_non_embed"] += count_parameters(layer, trainable_only=True)
-        total_stats["llm_non_embed"] += count_parameters(self.norm, trainable_only=False)
-        trainable_stats["llm_non_embed"] += count_parameters(self.norm, trainable_only=True)
+                total_stats["llm_non_embed"] += count_parameters(
+                    layer, trainable_only=False
+                )
+                trainable_stats["llm_non_embed"] += count_parameters(
+                    layer, trainable_only=True
+                )
+        total_stats["llm_non_embed"] += count_parameters(
+            self.norm, trainable_only=False
+        )
+        trainable_stats["llm_non_embed"] += count_parameters(
+            self.norm, trainable_only=True
+        )
 
-        total_stats["audio_adapter"] += count_parameters(self.audio_decoder_proj.audio_lm_head, trainable_only=False)
+        total_stats["audio_adapter"] += count_parameters(
+            self.audio_decoder_proj.audio_lm_head, trainable_only=False
+        )
         trainable_stats["audio_adapter"] += count_parameters(
             self.audio_decoder_proj.audio_lm_head, trainable_only=True
         )
-        total_stats["llm_embed"] += count_parameters(self.audio_decoder_proj.text_lm_head, trainable_only=False)
-        trainable_stats["llm_embed"] += count_parameters(self.audio_decoder_proj.text_lm_head, trainable_only=True)
+        total_stats["llm_embed"] += count_parameters(
+            self.audio_decoder_proj.text_lm_head, trainable_only=False
+        )
+        trainable_stats["llm_embed"] += count_parameters(
+            self.audio_decoder_proj.text_lm_head, trainable_only=True
+        )
 
         other_audio_modules = [self.audio_encoder_proj]
         if self.use_audio_out_embed_projector:
@@ -2119,8 +2664,12 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
 
         for mod in other_audio_modules:
             if mod is not None:
-                total_stats["audio_adapter"] += count_parameters(mod, trainable_only=False)
-                trainable_stats["audio_adapter"] += count_parameters(mod, trainable_only=True)
+                total_stats["audio_adapter"] += count_parameters(
+                    mod, trainable_only=False
+                )
+                trainable_stats["audio_adapter"] += count_parameters(
+                    mod, trainable_only=True
+                )
         return {"trainable": trainable_stats, "total": total_stats}
 
     def set_skip_audio_tower(self):
@@ -2140,7 +2689,9 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
             for param in self.audio_encoder_proj.parameters():
                 param.requires_grad = False
 
-    def freeze_llm(self, freeze_embed=True, freeze_embed_until_idx: Optional[int] = None):
+    def freeze_llm(
+        self, freeze_embed=True, freeze_embed_until_idx: Optional[int] = None
+    ):
         for layer in self.layers:
             if isinstance(layer, HiggsAudioDualFFNDecoderLayer):
                 for param in layer.self_attn.parameters():
@@ -2167,7 +2718,8 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
             else:
                 assert isinstance(self.embed_tokens, nn.Embedding)
                 self.embed_tokens = PartiallyFrozenEmbedding(
-                    original_embedding=self.embed_tokens, freeze_until_idx=freeze_embed_until_idx
+                    original_embedding=self.embed_tokens,
+                    freeze_until_idx=freeze_embed_until_idx,
                 )
 
     def freeze_text_head(self, freeze_text_head_until_idx: Optional[int] = None):
@@ -2179,11 +2731,14 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
         else:
             assert isinstance(self.audio_decoder_proj.text_lm_head, nn.Linear)
             self.audio_decoder_proj.text_lm_head = PartiallyFrozenLinear(
-                original_linear=self.audio_decoder_proj.text_lm_head, freeze_until_idx=freeze_text_head_until_idx
+                original_linear=self.audio_decoder_proj.text_lm_head,
+                freeze_until_idx=freeze_text_head_until_idx,
             )
 
     @classmethod
-    def merge_weights_from_checkpoint(cls, checkpoint_dir: str, merged_output_dir: str, *model_args, **kwargs):
+    def merge_weights_from_checkpoint(
+        cls, checkpoint_dir: str, merged_output_dir: str, *model_args, **kwargs
+    ):
         # For users' convenience, we merge back embedding and text_lm_head if they are splitted
         splitted_model = super().from_pretrained(
             checkpoint_dir,
@@ -2209,7 +2764,9 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
             state_dict["audio_decoder_proj.text_lm_head.weight"] = torch.cat(
                 [
                     state_dict["audio_decoder_proj.text_lm_head.linear_frozen.weight"],
-                    state_dict["audio_decoder_proj.text_lm_head.linear_trainable.weight"],
+                    state_dict[
+                        "audio_decoder_proj.text_lm_head.linear_trainable.weight"
+                    ],
                 ],
                 dim=0,
             )
@@ -2236,17 +2793,21 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
         splitted_model.load_state_dict(state_dict, strict=True)
 
         if merged_output_dir:
-            splitted_model.save_pretrained(merged_output_dir, is_main_process=True, state_dict=state_dict)
+            splitted_model.save_pretrained(
+                merged_output_dir, is_main_process=True, state_dict=state_dict
+            )
 
     @torch.inference_mode()
-    def capture_model(self, past_key_values: list[Union[Cache, List[torch.FloatTensor]]]) -> None:
+    def capture_model(
+        self, past_key_values: list[Union[Cache, List[torch.FloatTensor]]]
+    ) -> None:
         """Capture CUDA graphs for the model's forward pass with different KV cache lengths.
 
         Args:
             past_key_values: List of KV caches to capture graphs for
         """
         for past_key_value in past_key_values:
-            kv_cache_length = past_key_value.get_max_length()
+            kv_cache_length = _get_cache_max_length(past_key_value)
             # We capture two graphs, one for decoding audio tokens and one for decoding text tokens
             for is_decoding_audio_token in [True, False]:
                 runner = CUDAGraphRunner(self._forward_core)
@@ -2256,16 +2817,24 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
                 hidden_dim = self.config.hidden_size
 
                 hidden_states = torch.zeros(
-                    (batch_size, 1, hidden_dim), dtype=self.config.torch_dtype, device=self.device
+                    (batch_size, 1, hidden_dim),
+                    dtype=self.config.torch_dtype,
+                    device=self.device,
                 )
                 causal_mask = torch.ones(
-                    (batch_size, 1, 1, kv_cache_length), dtype=self.config.torch_dtype, device=self.device
+                    (batch_size, 1, 1, kv_cache_length),
+                    dtype=self.config.torch_dtype,
+                    device=self.device,
                 )
-                position_ids = torch.zeros((batch_size, 1), dtype=torch.long, device=self.device)
+                position_ids = torch.zeros(
+                    (batch_size, 1), dtype=torch.long, device=self.device
+                )
                 audio_discrete_codes_mask = torch.tensor(
                     [[is_decoding_audio_token]], dtype=torch.bool, device=self.device
                 )
-                cache_position = torch.tensor([kv_cache_length - 1], dtype=torch.long, device=self.device)
+                cache_position = torch.tensor(
+                    [kv_cache_length - 1], dtype=torch.long, device=self.device
+                )
                 audio_attention_mask = torch.ones_like(causal_mask)
                 fast_forward_attention_mask = torch.ones_like(causal_mask)
 
@@ -2286,4 +2855,6 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
                     stream=torch.cuda.Stream(device=self.device),
                 )
 
-                self.decode_graph_runners[kv_cache_length][is_decoding_audio_token] = runner
+                self.decode_graph_runners[kv_cache_length][is_decoding_audio_token] = (
+                    runner
+                )

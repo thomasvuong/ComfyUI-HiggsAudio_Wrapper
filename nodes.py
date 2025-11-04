@@ -15,6 +15,7 @@ try:
     import soundfile as sf
 except ImportError:
     print("Warning: soundfile not installed. Install with: pip install soundfile")
+import traceback
 
 # Global engine cache to avoid reloading
 _engine_cache = {}
@@ -283,6 +284,14 @@ class HiggsAudio:
         start_time = time.time()
         
         try:
+            # Debug: surface some context before calling the engine
+            try:
+                print(f"HiggsAudio DEBUG: calling serve_engine.generate, device={device}, model={MODEL_PATH}")
+                print(f"HiggsAudio DEBUG: messages_len={len(messages)}, used_voice_info={used_voice_info}")
+            except Exception:
+                # safe fallback if messages aren't introspectable
+                print("HiggsAudio DEBUG: could not introspect messages")
+
             output: HiggsAudioResponse = serve_engine.generate(
                 chat_ml_sample=ChatMLSample(messages=messages),
                 max_new_tokens=max_new_tokens,
@@ -291,8 +300,31 @@ class HiggsAudio:
                 top_k=top_k if top_k > 0 else None,
                 stop_strings=["<|end_of_text|>", "<|eot_id|>"],
             )
+
+            # Debug: show a brief summary of the response
+            try:
+                print(f"HiggsAudio DEBUG: generate returned sampling_rate={getattr(output, 'sampling_rate', None)}, audio_present={getattr(output, 'audio', None) is not None}")
+            except Exception:
+                print("HiggsAudio DEBUG: unable to summarize output")
         except Exception as e:
+            # Print full traceback and some diagnostic info to comfyUI logs
             print(f"Error during audio generation: {e}")
+            traceback.print_exc()
+            try:
+                # Surface some engine internals (keys only) that are safe to print
+                if hasattr(serve_engine, 'kv_caches'):
+                    try:
+                        keys = list(serve_engine.kv_caches.keys())
+                        print(f"HiggsAudio DEBUG: serve_engine.kv_caches keys={keys}")
+                        # Print type and repr of one cache for diagnosis
+                        if len(keys) > 0:
+                            k = keys[0]
+                            cache_obj = serve_engine.kv_caches[k]
+                            print(f"HiggsAudio DEBUG: one cache type={type(cache_obj)}, attrs={[a for a in dir(cache_obj) if not a.startswith('_')][:20]}")
+                    except Exception:
+                        print("HiggsAudio DEBUG: failed to inspect kv_caches")
+            except Exception:
+                pass
             raise e
         
         generation_time = time.time() - start_time

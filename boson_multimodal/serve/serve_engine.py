@@ -244,6 +244,20 @@ class HiggsAudioServeEngine:
             for length in sorted(kv_cache_lengths)
         }
 
+        # Compatibility shim: some versions expect StaticCache.get_max_length(), while
+        # newer StaticCache exposes get_seq_length(). Add a class-level alias if missing.
+        try:
+            from transformers.cache_utils import StaticCache as _StaticCacheClass
+
+            if not hasattr(_StaticCacheClass, "get_max_length") and hasattr(_StaticCacheClass, "get_seq_length"):
+                def _get_max_length(self):
+                    return self.get_seq_length()
+
+                setattr(_StaticCacheClass, "get_max_length", _get_max_length)
+                logger.info("Patched StaticCache: added get_max_length alias to get_seq_length for compatibility")
+        except Exception as e:
+            logger.warning(f"Failed to apply StaticCache compatibility shim: {e}")
+
         if self.model.config.encode_whisper_embed:
             logger.info(f"Loading whisper processor")
             whisper_processor = AutoProcessor.from_pretrained(
@@ -253,6 +267,15 @@ class HiggsAudioServeEngine:
             )
         else:
             whisper_processor = None
+
+        # Compatibility shim: some older/newer model code expects `_attn_implementation` to be set.
+        # If it's missing or None, set to 'torch' as a safe fallback.
+        try:
+            if getattr(self.model.config, "_attn_implementation", None) is None:
+                logger.info("Model config _attn_implementation is None - setting to 'torch' for compatibility")
+                self.model.config._attn_implementation = "torch"
+        except Exception as e:
+            logger.warning(f"Failed to set _attn_implementation compatibility shim: {e}")
 
         # Reuse collator to prepare inference samples
         self.collator = HiggsAudioSampleCollator(
@@ -332,8 +355,42 @@ class HiggsAudioServeEngine:
         return inputs
 
     def _prepare_kv_caches(self):
-        for kv_cache in self.kv_caches.values():
-            kv_cache.reset()
+        """Reset and (if supported) early-initialize all static KV caches.
+
+        Some StaticCache implementations require an early initialization step
+        to allocate internal buffers and set their reported max length. Without
+        this, get_max_length()/get_seq_length() may return 0 which later causes
+        the model forward to raise a ValueError about cache size.
+        """
+        for length, kv_cache in self.kv_caches.items():
+            try:
+                # Reset first
+                kv_cache.reset()
+            except Exception:
+                logger.debug(f"KV cache reset failed for length={length}", exc_info=True)
+
+            # Try early initialization if available
+            try:
+                if hasattr(kv_cache, "early_initialization"):
+                    try:
+                        kv_cache.early_initialization()
+                        logger.info(f"KV cache early_initialization called for length={length}")
+                    except Exception:
+                        logger.debug(f"KV cache early_initialization failed for length={length}", exc_info=True)
+
+                # Log the reported max length for diagnostics
+                try:
+                    max_len = (
+                        kv_cache.get_max_length()
+                        if hasattr(kv_cache, "get_max_length")
+                        else kv_cache.get_seq_length()
+                    )
+                    logger.info(f"KV cache length={length} reports max_length={max_len}")
+                except Exception:
+                    logger.debug(f"Unable to query max length for kv_cache length={length}", exc_info=True)
+            except Exception:
+                # Keep going; we don't want cache initialization to crash startup
+                logger.warning(f"Unexpected error while preparing kv_cache length={length}", exc_info=True)
 
     def generate(
         self,
@@ -376,21 +433,111 @@ class HiggsAudioServeEngine:
 
             self._prepare_kv_caches()
 
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                use_cache=True,
-                stop_strings=stop_strings,
-                tokenizer=self.tokenizer,
-                do_sample=False if temperature == 0.0 else True,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                past_key_values_buckets=self.kv_caches,
-                ras_win_len=ras_win_len,
-                ras_win_max_num_repeat=ras_win_max_num_repeat,
-                seed=seed,
-            )
+            # Ensure attention implementation is set at generation time (some configs
+            # can be None earlier which leads to KeyError during attention lookup).
+            try:
+                current_attn_impl = getattr(self.model.config, "_attn_implementation", None)
+                if current_attn_impl is None:
+                    logger.info("Model config _attn_implementation is None at generate time - setting to 'torch'")
+                    self.model.config._attn_implementation = "torch"
+                else:
+                    logger.debug(f"Model config _attn_implementation={current_attn_impl}")
+            except Exception:
+                logger.debug("Failed to inspect/set model.config._attn_implementation", exc_info=True)
+
+            # Defensive monkeypatch: some transformers builds may attempt to
+            # look up ALL_ATTENTION_FUNCTIONS[None] which raises KeyError.
+            # Ensure the llama ALL_ATTENTION_FUNCTIONS mapping has a sensible
+            # default entry for None to avoid KeyError in attention lookup.
+            try:
+                import transformers.models.llama.modeling_llama as _llama_mod
+
+                try:
+                    _mapping = getattr(_llama_mod, "ALL_ATTENTION_FUNCTIONS")
+                    # _mapping may be an AttentionInterface-like object exposing
+                    # a dict under _global_mapping; try to set a fallback.
+                    if hasattr(_mapping, "_global_mapping"):
+                        gm = _mapping._global_mapping
+                        if None not in gm:
+                            # Prefer 'sdpa' if available, else 'eager', else pick any existing mapping
+                            if "sdpa" in gm:
+                                gm[None] = gm["sdpa"]
+                            elif "eager" in gm:
+                                gm[None] = gm["eager"]
+                            else:
+                                # fallback: pick first mapping value
+                                first_key = next(iter(gm.keys()))
+                                gm[None] = gm[first_key]
+                            logger.debug("Patched ALL_ATTENTION_FUNCTIONS to include fallback for None key")
+                except Exception:
+                    logger.debug("Failed to patch ALL_ATTENTION_FUNCTIONS mapping for None key", exc_info=True)
+            except Exception:
+                # If transformers is not present or import fails, ignore.
+                pass
+
+            # Only pass static KV caches that report a non-zero max length; if
+            # all static caches appear uninitialized (max_length == 0) we skip
+            # passing them to avoid triggering static-cache code paths in the model.
+            usable_kv_caches = {}
+            try:
+                for length, cache in self.kv_caches.items():
+                    try:
+                        max_len = cache.get_max_length() if hasattr(cache, "get_max_length") else cache.get_seq_length()
+                    except Exception:
+                        max_len = 0
+                    if max_len and int(max_len) > 0:
+                        usable_kv_caches[length] = cache
+            except Exception:
+                usable_kv_caches = {}
+
+            try:
+                if len(usable_kv_caches) > 0:
+                    past_key_values_buckets_arg = {k: v for k, v in usable_kv_caches.items()}
+                else:
+                    past_key_values_buckets_arg = None
+
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    use_cache=True,
+                    stop_strings=stop_strings,
+                    tokenizer=self.tokenizer,
+                    do_sample=False if temperature == 0.0 else True,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    past_key_values_buckets=past_key_values_buckets_arg,
+                    ras_win_len=ras_win_len,
+                    ras_win_max_num_repeat=ras_win_max_num_repeat,
+                    seed=seed,
+                )
+            except ValueError as e:
+                # Compatibility: Some StaticCache implementations or states may report
+                # a zero max length and cause the model to raise about cache size.
+                # Retry generation without static kv cache buckets (dynamic cache) as a fallback.
+                logger.warning(f"Static KV cache generation failed: {e}. Retrying with dynamic/no-cache generation.")
+                try:
+                    # Attempt a no-cache generation path; this avoids passing any
+                    # past_key_values_buckets and turns off use_cache. It's slower
+                    # but bypasses static cache compatibility issues.
+                    outputs = self.model.generate(
+                        **inputs,
+                        max_new_tokens=max_new_tokens,
+                        use_cache=False,
+                        stop_strings=stop_strings,
+                        tokenizer=self.tokenizer,
+                        do_sample=False if temperature == 0.0 else True,
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
+                        ras_win_len=ras_win_len,
+                        ras_win_max_num_repeat=ras_win_max_num_repeat,
+                        seed=seed,
+                    )
+                except Exception as e2:
+                    # Log full details and re-raise so callers see the original failure
+                    logger.exception("Fallback (no-cache) generation also failed")
+                    raise
 
             if len(outputs[1]) > 0:
                 wv_list = []
