@@ -248,3 +248,30 @@ For issues and questions:
 ---
 
 **Note**: This wrapper requires significant computational resources. A CUDA-compatible GPU with 8GB+ VRAM is recommended for optimal performance.
+
+## Long-form generation (audiobooks / podcasts)
+
+HiggsAudio can generate very long audio, but you should avoid asking the model to produce hours of audio in a single generation call. Instead, use chunked generation with streaming-to-disk and resume support. We provide a helper script at `scripts/generate_long_audio.py` that implements a safe default workflow.
+
+Key recommendations:
+- Use chunk sizes of 4k–8k tokens (defaults: 4096). 4096 tokens ≈ 2.7 minutes; 8192 ≈ 5.5 minutes.
+- Keep a small overlap (128–512 tokens) or crossfade of 40–160 ms to reduce audible seams.
+- On Apple M-series use `--device mps` when available; otherwise `cpu`.
+- If generating multi-hour audio, use `--stream` to write chunk files to disk and a manifest for resume. The script will stitch chunks with crossfade and produce a single WAV.
+
+Quick CLI example (conservative):
+
+```bash
+python3 scripts/generate_long_audio.py \
+    /path/to/book.txt /path/to/output_book.wav \
+    --model bosonai/higgs-audio-v2-generation-3B-base \
+    --tokenizer bosonai/higgs-audio-v2-tokenizer \
+    --device mps \
+    --chunk_max_tokens 4096 \
+    --crossfade_ms 60 \
+    --stream
+```
+
+If generation is interrupted, re-run the same command — the script will detect the manifest and resume from the last completed chunk.
+
+See `scripts/tests/test_generate_stream.py` for a small unit test that validates streaming and stitching (uses a mock engine).
