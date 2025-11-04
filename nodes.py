@@ -151,7 +151,7 @@ class HiggsAudio:
                 "AUDIO_TOKENIZER_PATH": ("AUDIOTOKENIZER",),
                 "system_prompt": ("SYSTEMPROMPT",),
                 "prompt": ("STRING",),
-                "max_new_tokens": ("INT", {"default": 1024, "min": 128, "max": 4096}),
+                "max_new_tokens": ("INT", {"default": 1024, "min": 128, "max": 262144}),
                 "temperature": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1}),
                 "top_p": ("FLOAT", {"default": 0.95, "min": 0.1, "max": 1.0, "step": 0.05}),
                 "top_k": ("INT", {"default": 50, "min": -1, "max": 100}),
